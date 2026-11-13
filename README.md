@@ -225,6 +225,14 @@ bent, hoeveel sessies draaien en hoeveel vragen zijn uitgesteld. Linksklik
 wisselt tussen aanwezig en afwezig, rechtsklik opent het overzicht, midden
 ververst. `install.sh` zet hem in `~/.config/omarchy/plugins/lidswitch/`.
 
+De widget staat ook als losse plugin in
+[lidswitch-omarchy](https://github.com/michielturmel-max/lidswitch-omarchy), met
+een eigen README en de marketplace-manifest in de root:
+
+```bash
+omarchy plugin add https://github.com/michielturmel-max/lidswitch-omarchy --enable
+```
+
 ## Weghalen
 
 ```bash
