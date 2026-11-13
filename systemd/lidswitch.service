@@ -1,0 +1,27 @@
+# Lidswitch watches the lid and records when the user leaves and returns.
+#
+# The service polls the ACPI lid switch rather than binding the Hyprland switch
+# event, because Hyprland accepts a single binding per switch and Omarchy's
+# already owns that edge in order to lock the screen and take the display down.
+# Polling also keeps working when no compositor is running at all.
+#
+# Polling costs one short read per second, well under a percent of a core. That
+# is the price of not fighting Omarchy for the same binding.
+
+[Unit]
+Description=Lidswitch: volg het deksel voor zelfstandig AI-werk
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/lidswitch watch
+Restart=always
+RestartSec=2
+
+# Nothing here needs privileges. The lid state is readable by the user, and the
+# only privileged change lidswitch needs (logind not suspending on lid close) is
+# a one-off drop-in that install.sh applies.
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

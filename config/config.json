@@ -1,0 +1,10 @@
+{
+  "notify": true,
+  "awayInClamshell": true,
+  "sleepWhenDone": {
+    "enabled": true,
+    "afterMinutes": 20,
+    "minAwayMinutes": 10,
+    "dryRun": false
+  }
+}

@@ -1,0 +1,588 @@
+#!/usr/bin/env bash
+# lidswitch - lid state owner for the "user is away" workflow.
+#
+# The lid itself is detected by Hyprland, which already binds both lid edges
+# (omarchy-system-lid-close / omarchy-hyprland-monitor-clamshell). This CLI is
+# the single writer of lid.json; every opencode plugin owns one file under
+# sessions/ and never contends for a lock.
+
+set -euo pipefail
+
+LIDSWITCH_HOME="${LIDSWITCH_HOME:-$HOME/.local/state/lidswitch}"
+LID_FILE="$LIDSWITCH_HOME/lid.json"
+SESSION_DIR="$LIDSWITCH_HOME/sessions"
+CONFIG_FILE="${LIDSWITCH_CONFIG:-$HOME/.config/lidswitch/config.json}"
+LOG_FILE="$LIDSWITCH_HOME/lidswitch.log"
+
+# When the quiet condition first held, so the sleep grace period measures time
+# spent with nothing to do rather than time since the lid shut.
+QUIET_SINCE=""
+
+# Set by sleep_decision. A global rather than command-substitution output,
+# because that would run in a subshell and quietly discard QUIET_SINCE.
+SLEEP_NOW=""
+
+# Resolve through the symlink install.sh puts on PATH, otherwise PROJECT_DIR
+# would end up one level above the real checkout.
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+SELF_DIR=$(cd -- "$(dirname -- "$SELF")" && pwd)
+PROJECT_DIR=$(dirname -- "$SELF_DIR")
+PLUGIN_LINK="$HOME/.config/opencode/plugin/lidswitch.ts"
+
+mkdir -p "$LIDSWITCH_HOME" "$SESSION_DIR"
+
+log() {
+  printf '%s %s\n' "$(date -Is)" "$*" >>"$LOG_FILE"
+  rotate_log
+}
+
+# The log is a plain file rather than the journal because CLI invocations from a
+# terminal have to land there too. That means nothing else trims it, so it is
+# capped here: logrotate would need root plus a timer for a file that only ever
+# receives one line per poll.
+rotate_log() {
+  command -v stat >/dev/null 2>&1 || return 0
+  [[ -f $LOG_FILE ]] || return 0
+
+  local max keep size
+  max=${LIDSWITCH_LOG_MAX_BYTES:-1048576}
+  keep=${LIDSWITCH_LOG_KEEP:-2}
+  [[ $max =~ ^[0-9]+$ ]] || max=1048576
+  [[ $keep =~ ^[0-9]+$ ]] || keep=2
+
+  size=$(stat -c %s "$LOG_FILE" 2>/dev/null) || return 0
+  [[ $size =~ ^[0-9]+$ ]] || return 0
+  (( size > max )) || return 0
+
+  # keep backups at .1 .. .keep; anything older is dropped
+  rm -f "${LOG_FILE}.${keep}"
+  local i
+  for (( i = keep - 1; i >= 1; i-- )); do
+    [[ -f ${LOG_FILE}.$i ]] && mv -f "${LOG_FILE}.$i" "${LOG_FILE}.$((i + 1))"
+  done
+  mv -f "$LOG_FILE" "${LOG_FILE}.1"
+  : >"$LOG_FILE"
+  return 0
+}
+
+# ---------------------------------------------------------------- config ----
+
+config() {
+  local key=$1 fallback=$2
+  if [[ -r $CONFIG_FILE ]] && command -v jq >/dev/null; then
+    local v
+    v=$(jq -r "$key // empty" "$CONFIG_FILE" 2>/dev/null) || v=
+    [[ -n $v ]] && printf '%s' "$v" && return 0
+  fi
+  printf '%s' "$fallback"
+}
+
+cfg_notify() { config '.notify' true; }
+cfg_away_in_clamshell() { config '.awayInClamshell' true; }
+
+# ------------------------------------------------------------------ state ----
+
+default_lid_state() {
+  cat <<JSON
+{
+  "lid": "open",
+  "away": false,
+  "clamshell": false,
+  "awaySince": null,
+  "changedAt": null,
+  "updatedAt": "$(date -Is)"
+}
+JSON
+}
+
+lid_state() {
+  if [[ -r $LID_FILE ]] && command -v jq >/dev/null; then
+    jq -c '.' "$LID_FILE" 2>/dev/null || default_lid_state
+  else
+    default_lid_state
+  fi
+}
+
+write_lid_state() {
+  local state=$1
+  printf '%s\n' "$state" >"$LID_FILE.tmp.$$"
+  mv -f "$LID_FILE.tmp.$$" "$LID_FILE"
+}
+
+# Sessions whose owning process is gone are stale: a crashed opencode must not
+# keep claiming to be busy. /proc is the only liveness source that needs no
+# bookkeeping of our own.
+prune_sessions() {
+  local f pid
+  shopt -s nullglob
+  for f in "$SESSION_DIR"/*.json; do
+    pid=$(jq -r '.pid // empty' "$f" 2>/dev/null) || pid=
+    if [[ -z $pid || ! -d /proc/$pid ]]; then
+      log "pruning stale session file $(basename "$f") (pid=${pid:-none})"
+      rm -f "$f"
+    fi
+  done
+  shopt -u nullglob
+}
+
+sessions_json() {
+  prune_sessions
+  command -v jq >/dev/null || {
+    printf '[]\n'
+    return 0
+  }
+
+  local files=()
+  shopt -s nullglob
+  files=("$SESSION_DIR"/*.json)
+  shopt -u nullglob
+
+  if [[ ${#files[@]} -eq 0 ]]; then
+    printf '[]\n'
+    return 0
+  fi
+
+  # jq prints its (empty) result before failing to open a file, so the exit
+  # status alone is not enough to trust stdout: take it only when it parses.
+  local parsed
+  parsed=$(jq -s '.' "${files[@]}" 2>/dev/null) || parsed=
+  if [[ -n $parsed ]] && jq -e 'type == "array"' <<<"$parsed" >/dev/null 2>&1; then
+    printf '%s\n' "$parsed"
+  else
+    printf '[]\n'
+  fi
+}
+
+# ------------------------------------------------------------------- lid ----
+
+# The lid itself is read, not signalled: Hyprland already owns the switch events
+# for locking and the display, and it accepts only one binding per switch, so a
+# second one would have to unbind Omarchy's. Reading the same ACPI file Omarchy
+# reads keeps this independent of the compositor and of which bind won.
+#
+# Prints open, closed, or unknown.
+hardware_lid_state() {
+  # Overridable so the watch loop can be exercised without shutting a real lid.
+  local acpi="${LIDSWITCH_ACPI_DIR:-/proc/acpi/button}"
+  local state
+  for state in "$acpi"/lid/*/state; do
+    [[ -r $state ]] || continue
+    if [[ $(<"$state") == *"closed"* ]]; then
+      printf 'closed'
+    elif [[ $(<"$state") == *"open"* ]]; then
+      printf 'open'
+    fi
+    return 0
+  done
+
+  if [[ -n ${LIDSWITCH_ACPI_DIR:-} ]]; then
+    printf 'unknown'
+    return 0
+  fi
+
+  # No ACPI button (or no permission on it): logind knows the same thing.
+  local value
+  value=$(busctl --system get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager LidClosed 2>/dev/null) || value=
+  case $value in
+    "b true") printf 'closed' ;;
+    "b false") printf 'open' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+hardware_lid_closed() {
+  [[ $(hardware_lid_state) == closed ]]
+}
+
+hardware_external_monitors() {
+  local drm="${OMARCHY_DRM_PATH:-/sys/class/drm}"
+  local status
+  for status in "$drm"/card*-*/status; do
+    [[ -e $status ]] || continue
+    [[ $status =~ -(eDP|LVDS|DSI)-[^/]+/status$ ]] && continue
+    [[ $(<"$status") == "connected" ]] && return 0
+  done
+  return 1
+}
+
+notify() {
+  local urgency=$1 title=$2 body=$3
+  [[ $(cfg_notify) == "true" ]] || return 0
+  # LIDSWITCH_QUIET dempt de meldingen voor geautomatiseerde controles. Zonder dit
+  # stuurt een test die de state-dir van de gebruiker raakt een melding per
+  # overgang, en dat is precies wat je niet wilt als er iemand aan de laptop zit.
+  [[ ${LIDSWITCH_QUIET:-0} == 1 ]] && return 0
+  command -v notify-send >/dev/null || return 0
+  notify-send --app-name=lidswitch --urgency="$urgency" "$title" "$body" >/dev/null 2>&1 || true
+}
+
+# A pending question is only interesting while nobody is there to answer it,
+# so the list is cleared as soon as the user is back.
+deferred_count() {
+  sessions_json | jq '[.[] | (.deferred // []) | length] | add // 0'
+}
+
+set_lid() {
+  local lid=$1 clamshell=false away=false previous previous_away
+
+  hardware_lid_closed && clamshell=true
+
+  if [[ $lid == "closed" ]]; then
+    # In clamshell the lid is shut but the external display is still the
+    # workstation; whether that counts as "away" is a policy choice, not a fact.
+    if [[ $clamshell == true && $(cfg_away_in_clamshell) != "true" ]]; then
+      away=false
+    else
+      away=true
+    fi
+  fi
+
+  previous=$(lid_state)
+  previous_away=$(jq -r '.away // false' <<<"$previous")
+
+  if [[ $(jq -r '.lid' <<<"$previous") == "$lid" && $previous_away == "$away" ]]; then
+    log "lid=$lid away=$away (no change)"
+    return 0
+  fi
+
+  local since
+  if [[ $away == true ]]; then
+    since=$(jq -r '.awaySince // empty' <<<"$previous")
+    [[ -n $since && $since != "null" ]] || since=$(date -Is)
+  else
+    since=null
+  fi
+
+  write_lid_state "$(jq -n \
+    --arg lid "$lid" \
+    --argjson away "$away" \
+    --argjson clamshell "$clamshell" \
+    --arg since "$since" \
+    --arg changed "$(date -Is)" \
+    '{lid:$lid, away:$away, clamshell:$clamshell, awaySince:(if $since=="null" then null else $since end), changedAt:$changed, updatedAt:$changed}')"
+
+  log "lid=$lid away=$away clamshell=$clamshell"
+
+  if [[ $away == true ]]; then
+    notify normal "Lidswitch: deksel dicht" "Je bent afwezig. Het model werkt zelfstandig door."
+  else
+    report_return "$previous_away"
+  fi
+}
+
+# On return the user needs one answer to two questions: is it still working,
+# and is anything waiting on me. The plugin injects the summary into the live
+# session; this notification is the version that does not need a terminal.
+report_return() {
+  local was_away=$1 sessions busy waiting deferred total summary
+
+  if [[ $was_away != "true" ]]; then
+    return 0
+  fi
+
+  sessions=$(sessions_json)
+  total=$(jq 'length' <<<"$sessions")
+  busy=$(jq '[.[] | select(.busy == true)] | length' <<<"$sessions")
+  waiting=$(jq '[.[] | select(.waiting == true)] | length' <<<"$sessions")
+  deferred=$(jq '[.[] | (.deferred // []) | length] | add // 0' <<<"$sessions")
+
+  if [[ $total -eq 0 ]]; then
+    summary="Geen opencode-sessie gevonden."
+  elif [[ $busy -gt 0 ]]; then
+    summary="$busy van $total sessies werken nog door."
+  else
+    summary="Alle sessies zijn klaar ($total totaal)."
+  fi
+
+  if [[ $deferred -gt 0 ]]; then
+    summary="$summary $deferred vraag/vragen staan klaar op het scherm."
+  elif [[ $waiting -gt 0 ]]; then
+    summary="$summary Er staat een vraag open."
+  fi
+
+  notify info "Lidswitch: terug" "$summary"
+  log "return: $summary"
+}
+
+# --------------------------------------------------------------- commands ----
+
+cmd_lid() {
+  case ${1:-} in
+    closed) set_lid closed ;;
+    open) set_lid open ;;
+    *)
+      echo "usage: lidswitch lid {closed|open}" >&2
+      return 2
+      ;;
+  esac
+}
+
+# Once there is nothing left to do, there is no reason to keep the machine
+# awake. This deliberately does not use logind's HandleLidSwitch: that setting is
+# global, so it would suspend on every lid close, including the ones where work
+# is still running. The daemon suspends instead, and only once the session files
+# say every session is idle with no open todos.
+#
+# Prints nothing; sets SLEEP_NOW to how long the condition has held when it is
+# time to sleep, and to the empty string otherwise.
+sleep_decision() {
+  SLEEP_NOW=""
+  local state
+  state=$(lid_state)
+
+  if [[ $(jq -r '.away // false' <<<"$state") != "true" ]]; then
+    QUIET_SINCE=""
+    return 0
+  fi
+
+  local min_away after
+  min_away=$(config '.sleepWhenDone.minAwayMinutes' 10)
+  after=$(config '.sleepWhenDone.afterMinutes' 20)
+  [[ $min_away =~ ^[0-9]+$ ]] || min_away=10
+  [[ $after =~ ^[0-9]+$ ]] || after=20
+
+  local now away_since away_start
+  now=$(date +%s)
+  away_since=$(jq -r '.awaySince // empty' <<<"$state")
+  away_start=$now
+  if [[ -n $away_since ]]; then
+    away_start=$(date -d "$away_since" +%s 2>/dev/null) || away_start=$now
+  fi
+  if (( (now - away_start) / 60 < min_away )); then
+    QUIET_SINCE=""
+    return 0
+  fi
+
+  local sessions pending
+  sessions=$(sessions_json)
+  pending=$(jq '[.[] | select((.busy // false) == true or (.openTodos // 0) > 0)] | length' <<<"$sessions")
+  if (( pending > 0 )); then
+    QUIET_SINCE=""
+    return 0
+  fi
+
+  if [[ -z $QUIET_SINCE ]]; then
+    QUIET_SINCE=$now
+    log "geen werk meer (${pending} drukke sessie(s), $(jq 'length' <<<"$sessions") sessie(s)); over ${after} min in slaapstand"
+    return 0
+  fi
+
+  local quiet
+  quiet=$((now - QUIET_SINCE))
+  (( quiet >= after * 60 )) || return 0
+  SLEEP_NOW=$quiet
+}
+
+maybe_sleep() {
+  sleep_decision || return 0
+  [[ -n $SLEEP_NOW ]] || return 0
+
+  QUIET_SINCE=""
+  notify normal "Lidswitch: werk klaar" "De laptop gaat in slaapstand."
+
+  if [[ $(config '.sleepWhenDone.dryRun' false) == "true" ]]; then
+    log "dryRun: ${SLEEP_NOW}s rust, zou nu systemctl suspend doen"
+    return 0
+  fi
+
+  log "niets meer te doen (${SLEEP_NOW}s rust); systemctl suspend"
+  if ! systemctl suspend >>"$LOG_FILE" 2>&1; then
+    log "systemctl suspend faalde"
+  fi
+}
+
+cmd_watch() {
+  local interval=${LIDSWITCH_POLL_INTERVAL:-1}
+  local check_interval=${LIDSWITCH_SLEEP_CHECK_INTERVAL:-60}
+  [[ $check_interval =~ ^[0-9]+$ ]] || check_interval=60
+  local previous="" next_sleep_check=0
+  log "watch gestart (interval ${interval}s)"
+
+  trap 'log "watch gestopt"; exit 0' TERM INT
+
+  while true; do
+    local current
+    current=$(hardware_lid_state)
+    if [[ $current != "unknown" && $current != "$previous" ]]; then
+      previous=$current
+      set_lid "$current" || log "set_lid $current faalde"
+    fi
+
+    local now
+    now=$(date +%s)
+    if (( now >= next_sleep_check )); then
+      next_sleep_check=$((now + check_interval))
+      maybe_sleep || log "slaapstand-controle faalde"
+    fi
+
+    sleep "$interval"
+  done
+}
+
+# Manual override for testing without touching the hardware. Still respects the
+# real hardware reading, so a manual "open" cannot fake presence while shut.
+cmd_override() {
+  local lid=$1 previous
+  previous=$(lid_state)
+  [[ $(jq -r '.lid' <<<"$previous") == "$lid" ]] && return 0
+  write_lid_state "$(jq -n \
+    --arg lid "$lid" \
+    --arg changed "$(date -Is)" \
+    --argjson away "$([[ $lid == closed ]] && echo true || echo false)" \
+    --argjson clamshell "$(hardware_lid_closed && echo true || echo false)" \
+    '{lid:$lid, away:$away, clamshell:$clamshell, awaySince:(if $lid=="closed" then $changed else null end), changedAt:$changed, updatedAt:$changed}')"
+  log "manual override lid=$lid"
+  [[ $lid == closed ]] && notify normal "Lidswitch: deksel dicht (handmatig)" "Je bent afwezig." || report_return true
+}
+
+cmd_status() {
+  local lid sessions
+  lid=$(lid_state)
+  sessions=$(sessions_json)
+
+  if [[ ${1:-} == "--json" ]]; then
+    jq -n --argjson lid "$lid" --argjson sessions "$sessions" '$lid + {sessions:$sessions}'
+    return 0
+  fi
+
+  local away clamshell since
+  away=$(jq -r '.away' <<<"$lid")
+  clamshell=$(jq -r '.clamshell' <<<"$lid")
+  since=$(jq -r '.awaySince // "-"' <<<"$lid")
+
+  echo "deksel     : $(jq -r '.lid' <<<"$lid")"
+  echo "afwezig    : $away"
+  [[ $clamshell == true ]] && echo "clamshell  : ja"
+  [[ $away == true ]] && echo "sinds      : $since"
+  echo "hardware   : $(hardware_lid_state)"
+  echo "externe monitor: $(hardware_external_monitors && echo ja || echo nee)"
+  echo
+
+  local n
+  n=$(jq 'length' <<<"$sessions")
+  if [[ $n -eq 0 ]]; then
+    echo "geen opencode-sessies geregistreerd"
+    return 0
+  fi
+
+  jq -r '.[] | "  \(.directory // "?")  [\(.sessionID // "onbekend")]  \(if .busy then "bezig" else "klaar" end)\(if .waiting then "  WACHT OP ANTWOORD" else "" end)  uitgesteld: \((.deferred // []) | length)"' <<<"$sessions"
+}
+
+cmd_deferred() {
+  sessions_json | jq -r '
+    [ .[] | (.directory // "?") as $dir | (.deferred // [])[] | {dir:$dir} + . ]
+    | sort_by(.at)
+    | .[]
+    | "[\(.dir)] \(.at)  \(.type)\(.pattern // "" | tostring | if . == "" then "" else "  \(.)" end)\n    \(.title)\n    -> uitgesteld: \(.reason // "vereist de gebruiker")"
+  '
+}
+
+# Wat de draaiende logind in het geheugen heeft. Logind leest zijn config eenmalig
+# bij het opstarten, dus na het plaatsen van de drop-in blijft dit de oude waarde
+# tot een herstart.
+logind_running_value() {
+  if [[ -n ${LIDSWITCH_LOGIND_RUNNING_VALUE:-} ]]; then
+    printf '%s\n' "$LIDSWITCH_LOGIND_RUNNING_VALUE"
+    return 0
+  fi
+  busctl --system get-property org.freedesktop.login1 /org/freedesktop/login1 \
+    org.freedesktop.login1.Manager HandleLidSwitch 2>/dev/null | awk '{print $NF}'
+}
+
+# Wat logind na een herstart gaat lezen: de drop-ins gemerged, zonder commentaar.
+# LIDSWITCH_LOGIND_CONFIG_FILE wijst een bestand aan in plaats van de merge, wat
+# nodig is om dit zonder echte logind te kunnen testen.
+logind_configured_value() {
+  if [[ -n ${LIDSWITCH_LOGIND_CONFIG_FILE:-} ]]; then
+    awk -F= '/^[[:space:]]*HandleLidSwitch/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' \
+      "$LIDSWITCH_LOGIND_CONFIG_FILE" 2>/dev/null || true
+    return 0
+  fi
+  systemd-analyze cat-config systemd/logind.conf 2>/dev/null |
+    grep -vE '^[[:space:]]*(#|$)' |
+    awk -F= '/^[[:space:]]*HandleLidSwitch/ {gsub(/[[:space:]]/, "", $2); print $2; exit}'
+}
+
+cmd_check() {
+  local bad=0
+
+  local handle configured
+  handle=$(logind_running_value)
+  configured=$(logind_configured_value)
+  printf 'logind HandleLidSwitch : %s\n' "${handle:-onbekend}"
+  if [[ $handle == '"ignore"' ]]; then
+    printf '  -> goed: deksel dicht gaat niet in slaapstand\n'
+  elif [[ $configured == "ignore" ]]; then
+    printf '  -> het bestand staat goed, maar de draaiende logind heeft het nog niet ingelezen.\n'
+    printf '     dat gebeurt bij het opstarten: herstart de laptop.\n'
+  else
+    printf '  -> NIET "ignore": de laptop gaat alsnog in slaapstand bij deksel dicht.\n'
+    printf '     los dit op met: sudo install -m644 %q %q\n' \
+      "$PROJECT_DIR/systemd/50-lidswitch-logind.conf" "/etc/systemd/logind.conf.d/50-lidswitch.conf"
+    printf '     (werkt pas na een reboot)\n'
+    bad=1
+  fi
+
+  local source
+  source=$(hardware_lid_state)
+  printf 'deksel uitlezen        : %s\n' "$source"
+  [[ $source == unknown ]] && {
+    printf '  -> geen ACPI-lidknop en logind geeft geen antwoord\n'
+    bad=1
+  }
+
+  local enabled active
+  enabled=$(systemctl --user is-enabled lidswitch.service 2>/dev/null || echo onbekend)
+  active=$(systemctl --user is-active lidswitch.service 2>/dev/null || echo onbekend)
+  printf 'lidswitch-service      : %s (actief: %s)\n' "$enabled" "$active"
+  if [[ $enabled != enabled ]]; then
+    printf '  -> niet ingeschakeld; los dit op met: systemctl --user enable --now lidswitch.service\n'
+    bad=1
+  fi
+
+  printf 'hyprland dekselbinding : %s\n' "$(hyprctl binds 2>/dev/null | grep -c 'switch:[a-z]*:Lid Switch' || true)"
+  printf '  -> Omarchy beheert de vergrendeling en het scherm zelf, daarom wordt hier niets aan veranderd\n'
+
+  printf 'config                 : %s\n' "${CONFIG_FILE:-geen (standaard)}"
+  printf 'plugin                 : %s\n' "${PLUGIN_LINK:-niet geïnstalleerd}"
+
+  if [[ $(config '.sleepWhenDone.enabled' false) == "true" ]]; then
+    printf 'slaapstand als klaar   : na %s min rust, vanaf %s min afwezig%s\n' \
+      "$(config '.sleepWhenDone.afterMinutes' 20)" \
+      "$(config '.sleepWhenDone.minAwayMinutes' 10)" \
+      "$([[ $(config '.sleepWhenDone.dryRun' false) == true ]] && printf ' (dryRun: er wordt niets gesuspend)' || printf '')"
+  else
+    printf 'slaapstand als klaar   : uit\n'
+  fi
+
+  local n
+  n=$(jq 'length' <<<"$(sessions_json)")
+  printf 'geregistreerde sessies : %s\n' "$n"
+  if [[ $n -eq 0 ]]; then
+    printf '  -> geen actieve sessie; herstart opencode zodat de plugin geladen wordt\n'
+  fi
+
+  return $bad
+}
+
+case ${1:-} in
+  lid) shift; cmd_lid "$@" ;;
+  watch) shift; cmd_watch "$@" ;;
+  override) shift; cmd_override "${1:-}" ;;
+  status) shift; cmd_status "$@" ;;
+  deferred) shift; cmd_deferred "$@" ;;
+  check) shift; cmd_check "$@" ;;
+  *)
+    cat >&2 <<USAGE
+lidswitch - dekselschakelaar voor zelfstandig AI-werk
+
+  lidswitch watch               volg het deksel (de systemd-service draait dit)
+  lidswitch lid closed|open     dekselgebeis verwerken
+  lidswitch override closed|open handmatig afwezig/aanwezig zonder de hardware
+  lidswitch status [--json]      huidige stand
+  lidswitch deferred             alles wat is uitgesteld tot je terug bent
+  lidswitch check                controleer of alles goed is ingericht
+USAGE
+    exit 2
+    ;;
+esac
