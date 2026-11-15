@@ -115,7 +115,10 @@ assert_contains "$("$LIDSWITCH" check 2>&1)" "geen ACPI-lidknop" "check wijst op
 # geplaatste drop-in is dus geen fout, en dat onderscheid moet check maken.
 printf '[Login]\n# HandleLidSwitch=poweroff\nHandleLidSwitch=ignore\n' >"$WORK/logind.conf"
 check_with_logind_config() {
-  LIDSWITCH_LOGIND_CONFIG_FILE="$1" "$LIDSWITCH" check 2>&1
+  # Ook de draaiende waarde vastzetten: op een machine waar de drop-in al
+  # actief is geeft busctl "ignore" terug en zou de test niets meer meten.
+  LIDSWITCH_LOGIND_RUNNING_VALUE='"suspend"' \
+    LIDSWITCH_LOGIND_CONFIG_FILE="$1" "$LIDSWITCH" check 2>&1
 }
 
 lid open   # de vorige test haalt de schijnbare dekselstand weg; check heeft hem nodig
